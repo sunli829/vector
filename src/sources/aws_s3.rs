@@ -10,13 +10,16 @@ use crate::{
 use codec::BytesDelimitedCodec;
 use futures::{
     compat::{Compat, Future01CompatExt},
-    future::{FutureExt, TryFutureExt},
-    stream::StreamExt,
+    future::{join_all, FutureExt, TryFutureExt},
+    stream::{self, StreamExt},
 };
 use futures01::Sink;
 use rusoto_core::{Region, RusotoError};
 use rusoto_s3::{GetObjectRequest, S3Client, S3};
-use rusoto_sqs::{GetQueueUrlError, GetQueueUrlRequest, ReceiveMessageRequest, Sqs, SqsClient};
+use rusoto_sqs::{
+    DeleteMessageError, DeleteMessageRequest, GetQueueUrlError, GetQueueUrlRequest, Message,
+    ReceiveMessageError, ReceiveMessageRequest, Sqs, SqsClient,
+};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use std::{convert::TryInto, time::Duration};
@@ -36,6 +39,7 @@ use tokio_util::codec::FramedRead;
 // * Max line bytes
 // * Make sure we are handling shutdown well
 // * Consider any special handling of FIFO SQS queues
+// * Consider having helper methods stream data and have top-level forward to pipeline
 //
 // Future work:
 // * Additional codecs. Just treating like `file` source with newlines for now
@@ -245,67 +249,42 @@ impl SqsIngestor {
     async fn run(self, out: Pipeline, shutdown: ShutdownSignal) -> Result<(), ()> {
         let mut interval = time::interval(self.poll_interval).map(|_| ());
         let mut shutdown = shutdown.compat();
-        let queue_url = &self.queue_url;
-        let sqs_client = &self.sqs_client;
 
         loop {
             select! {
                 Some(()) = interval.next() => (),
-                _ = &mut shutdown => break,
-                else => break,
+                _ = &mut shutdown => break Ok(()),
+                else => break Ok(()),
             };
 
             let messages = self.receive_messages().await.unwrap_or_default();
 
-            for message in messages.unwrap_or_default() {
-                let s3_event: S3Event =
-                    serde_json::from_str(message.body.unwrap_or_default().as_ref()).unwrap();
+            for message in messages {
+                let receipt_handle = message.receipt_handle.clone();
 
-                match self.handle_s3_event(s3_event, out.clone()).await {
+                match self.handle_sqs_message(message, out.clone()).await {
                     Ok(()) => {
                         if self.delete_message {
-                            self.delete_message(message.receipt_handle).await.unwrap();
+                            //self.delete_message(receipt_handle).await.unwrap();
                         }
-                    } // TODO ack message
+                    }
                     Err(()) => {} // TODO emit error
                 }
             }
         }
-        Ok(())
     }
 
-    async fn receive_messages(self) {
-        self.sqs_client
-            .receive_message(ReceiveMessageRequest {
-                // TODO additional parameters?
-                // TODO evaluate wait_time_seconds
-                queue_url: queue_url.to_string(),
-                max_number_of_messages: Some(10),
-                wait_time_seconds: Some(10),
-                // TODO handle timeouts > i64
-                visibility_timeout: Some(self.visibility_timeout.as_secs().try_into().unwrap()),
-                ..Default::default()
-            })
-            .map(|res| res.messages)
-    }
+    async fn handle_sqs_message(&self, message: Message, out: Pipeline) -> Result<(), ()> {
+        let s3_event: S3Event =
+            serde_json::from_str(message.body.unwrap_or_default().as_ref()).unwrap();
 
-    async fn delete_message(self, receipt_handle: Option<String>) {
-        let receipt_handle = receipt_handle.unwrap_or_default(); // TODO
-        self.sqs_client.delete_message(DeleteMessageRequest {
-            queue_url: self.queue_url.clone(),
-            receipt_handle: receipt_handle.unwrap_or_default(),
-            ..Default::default()
-        })
+        self.handle_s3_event(s3_event, out).map_ok(|_| ()).await
     }
 
     async fn handle_s3_event(&self, s3_event: S3Event, out: Pipeline) -> Result<(), ()> {
         for record in s3_event.records {
-            match self.handle_s3_event_record(record, out.clone()).await {
-                Ok(()) => {}
-                Err(()) => return Err(()), // TODO emit error
-            }
+            self.handle_s3_event_record(record, out.clone()).await?
         }
-
         Ok(())
     }
 
@@ -317,8 +296,8 @@ impl SqsIngestor {
         let object = self
             .s3_client
             .get_object(GetObjectRequest {
-                bucket: s3_event.s3.bucket.name,
-                key: s3_event.s3.object.key,
+                bucket: s3_event.s3.bucket.name.clone(),
+                key: s3_event.s3.object.key.clone(),
                 ..Default::default()
             })
             .await
@@ -326,19 +305,41 @@ impl SqsIngestor {
 
         // TODO assert event type
 
+        let metadata = object.metadata.unwrap_or_default().clone(); // TODO can we avoid cloning the hashmap?
+
         match object.body {
             Some(body) => {
                 let stream = FramedRead::new(
                     body.into_async_read(),
                     BytesDelimitedCodec::new_with_max_length(b'\n', 100000),
                 )
-                .filter_map(|line| async move {
-                    match line {
-                        Ok(line) => Some(Ok(Event::from(line))),
-                        Err(err) => {
-                            // TODO handling IO errors here?
-                            dbg!(err);
-                            None
+                .filter_map(|line| {
+                    let bucket_name = s3_event.s3.bucket.name.clone();
+                    let object_key = s3_event.s3.object.key.clone();
+                    let aws_region = s3_event.aws_region.clone();
+                    let metadata = metadata.clone();
+
+                    async move {
+                        match line {
+                            Ok(line) => {
+                                let mut event = Event::from(line);
+
+                                let log = event.as_mut_log();
+                                log.insert("bucket", bucket_name);
+                                log.insert("object", object_key);
+                                log.insert("region", aws_region);
+
+                                for (key, value) in &metadata {
+                                    log.insert(key, value.clone());
+                                }
+
+                                Some(Ok(event))
+                            }
+                            Err(err) => {
+                                // TODO handling IO errors here?
+                                dbg!(err);
+                                None
+                            }
                         }
                     }
                 });
@@ -354,14 +355,36 @@ impl SqsIngestor {
             }
             None => Ok(()),
         }
-        // TODO:
-        // Fetch SQS message(s)
-        // Fetch object for each message
-        // Decompress (if needed)
-        // Create LogEvent, add tags
-        //async fn capture_logs(&self) -> impl Iterator<Item = Event> {
-        //vec![].into_iter()
-        //}
+    }
+
+    async fn receive_messages(&self) -> Result<Vec<Message>, RusotoError<ReceiveMessageError>> {
+        self.sqs_client
+            .receive_message(ReceiveMessageRequest {
+                // TODO additional parameters?
+                // TODO evaluate wait_time_seconds
+                queue_url: self.queue_url.clone(),
+                max_number_of_messages: Some(10),
+                wait_time_seconds: Some(10),
+                // TODO handle timeouts > i64
+                visibility_timeout: Some(self.visibility_timeout.as_secs().try_into().unwrap()),
+                ..Default::default()
+            })
+            .map_ok(|res| res.messages.unwrap_or_default()) // TODO
+            .await
+    }
+
+    async fn delete_message(
+        &self,
+        receipt_handle: Option<String>,
+    ) -> Result<(), RusotoError<DeleteMessageError>> {
+        let receipt_handle = receipt_handle.unwrap_or_default(); // TODO
+        self.sqs_client
+            .delete_message(DeleteMessageRequest {
+                queue_url: self.queue_url.clone(),
+                receipt_handle,
+                ..Default::default()
+            })
+            .await
     }
 }
 
