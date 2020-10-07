@@ -2,7 +2,7 @@ use crate::{
     config::{DataType, GlobalOptions, SourceConfig, SourceDescription},
     dns::Resolver,
     event::Event,
-    region::RegionOrEndpoint,
+    region::{self, RegionOrEndpoint},
     shutdown::ShutdownSignal,
     sinks::util::rusoto,
     Pipeline,
@@ -14,28 +14,31 @@ use futures::{
     stream::StreamExt,
 };
 use futures01::Sink;
-use rusoto_core::Region;
+use rusoto_core::{Region, RusotoError};
 use rusoto_s3::{GetObjectRequest, S3Client, S3};
-use rusoto_sqs::{GetQueueUrlRequest, ReceiveMessageRequest, Sqs, SqsClient};
+use rusoto_sqs::{GetQueueUrlError, GetQueueUrlRequest, ReceiveMessageRequest, Sqs, SqsClient};
 use serde::{Deserialize, Serialize};
+use snafu::{ResultExt, Snafu};
 use std::{convert::TryInto, time::Duration};
 use tokio::{select, time};
 use tokio_util::codec::FramedRead;
 
 // TODO:
+// * Handle decompression
 // * Revisit configuration of queue. Should we take the URL instead?
 //   * At the least, support setting a differente queue owner
 // * Move AWS utils from sink to general
 // * Use multiline config
-// * Share provider config?
+// * Consider / decide on multi-region S3 support (handling messages referring to buckets in
+//   multiple regions)
+// * Consider / decide on custom endpoint support
+//   * How would we handle this for multi-region S3 support?
+// * Max line bytes
+// * Make sure we are handling shutdown well
+// * Consider any special handling of FIFO SQS queues
 //
-// * Look at Tower service
-//
-// Questions:
-// * Handling shutdown gracefully
-//   * Don't poll for new messages; finish processing current set
-// * Concurrency. Should we process objects / messages concurrently?
-// * Why does send_all/forward return the sink?
+// Future work:
+// * Additional codecs. Just treating like `file` source with newlines for now
 
 #[derive(Copy, Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -85,8 +88,7 @@ struct AwsS3Config {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SqsConfig {
-    #[serde(flatten)]
-    region: RegionOrEndpoint,
+    region: Region,
     queue_name: String,
     #[serde(default = "default_poll_interval_secs")]
     poll_secs: u64,
@@ -124,7 +126,7 @@ impl SourceConfig for AwsS3Config {
         match self.strategy {
             Strategy::Sqs => Ok(Box::new(
                 self.create_sqs_ingestor()
-                    .await
+                    .await?
                     .run(out, shutdown)
                     .boxed()
                     .compat(),
@@ -141,28 +143,54 @@ impl SourceConfig for AwsS3Config {
     }
 }
 
+#[derive(Debug, Snafu)]
+enum CreateSqsIngestorError {
+    #[snafu(display("Unable to initialize: {}", source))]
+    Initialize { source: SqsIngestorNewError },
+    #[snafu(display("Unable to create AWS client: {}", source))]
+    Client { source: crate::Error },
+    #[snafu(display("Unable to create AWS credentials provider: {}", source))]
+    Credentials { source: crate::Error },
+    #[snafu(display("sqs configuration required when strategy=sqs"))]
+    ConfigMissing,
+}
+
 impl AwsS3Config {
-    async fn create_sqs_ingestor(&self) -> SqsIngestor {
+    async fn create_sqs_ingestor(&self) -> Result<SqsIngestor, CreateSqsIngestorError> {
         match self.sqs {
             Some(ref sqs) => {
-                let region: Region = (&sqs.region).try_into().unwrap();
                 // TODO:
                 // * move resolver?
                 // * try cloning credentials provider again?
                 let resolver = Resolver;
-                let client = rusoto::client(resolver).unwrap();
+                let client = rusoto::client(resolver).with_context(|| Client {})?;
                 let creds =
-                    rusoto::AwsCredentialsProvider::new(&region, self.assume_role.clone()).unwrap();
-                let sqs_client = SqsClient::new_with(client.clone(), creds, region.clone());
+                    rusoto::AwsCredentialsProvider::new(&sqs.region, self.assume_role.clone())
+                        .with_context(|| Credentials {})?;
+                let sqs_client = SqsClient::new_with(client.clone(), creds, sqs.region.clone());
                 let creds =
-                    rusoto::AwsCredentialsProvider::new(&region, self.assume_role.clone()).unwrap();
-                let s3_client = S3Client::new_with(client.clone(), creds, region.clone());
+                    rusoto::AwsCredentialsProvider::new(&sqs.region, self.assume_role.clone())
+                        .with_context(|| Credentials {})?;
+                let s3_client = S3Client::new_with(client.clone(), creds, sqs.region.clone());
 
-                SqsIngestor::new(sqs_client, s3_client, sqs.clone(), self.compression).await
+                SqsIngestor::new(sqs_client, s3_client, sqs.clone(), self.compression)
+                    .await
+                    .with_context(|| Initialize {})
             }
-            None => unimplemented!("TODO"),
+            None => Err(CreateSqsIngestorError::ConfigMissing {}),
         }
     }
+}
+
+#[derive(Debug, Snafu)]
+enum SqsIngestorNewError {
+    #[snafu(display("Unable to fetch queue URL for {}: {}", name, source))]
+    FetchQueueUrl {
+        source: RusotoError<GetQueueUrlError>,
+        name: String,
+    },
+    #[snafu(display("Got an empty queue URL for {}", name))]
+    MissingQueueUrl { name: String },
 }
 
 struct SqsIngestor {
@@ -183,19 +211,25 @@ impl SqsIngestor {
         s3_client: S3Client,
         config: SqsConfig,
         compression: Compression,
-    ) -> SqsIngestor {
+    ) -> Result<SqsIngestor, SqsIngestorNewError> {
         // TODO error handling
-        let queue_url = sqs_client
+        let queue_url_result = sqs_client
             .get_queue_url(GetQueueUrlRequest {
                 queue_name: config.queue_name.clone(),
                 ..Default::default()
             })
             .await
-            .unwrap()
-            .queue_url
-            .unwrap();
+            .with_context(|| FetchQueueUrl {
+                name: config.queue_name.clone(),
+            })?;
 
-        SqsIngestor {
+        let queue_url = queue_url_result
+            .queue_url
+            .ok_or(SqsIngestorNewError::MissingQueueUrl {
+                name: config.queue_name.clone(),
+            })?;
+
+        Ok(SqsIngestor {
             s3_client,
             sqs_client,
 
@@ -205,7 +239,7 @@ impl SqsIngestor {
             poll_interval: Duration::from_secs(config.poll_secs),
             visibility_timeout: Duration::from_secs(config.visibility_timeout_secs),
             delete_message: config.delete_message,
-        }
+        })
     }
 
     async fn run(self, out: Pipeline, shutdown: ShutdownSignal) -> Result<(), ()> {
@@ -221,52 +255,49 @@ impl SqsIngestor {
                 else => break,
             };
 
-            let receive_message_result = sqs_client
-                .receive_message(ReceiveMessageRequest {
-                    // TODO additional parameters?
-                    // TODO evaluate wait_time_seconds
-                    queue_url: queue_url.to_string(),
-                    max_number_of_messages: Some(10),
-                    wait_time_seconds: Some(10),
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
+            let messages = self.receive_messages().await.unwrap_or_default();
 
-            //let messages: Box<dyn Stream<Item = (Bytes, String), Error = ()> + Send> =
-            for message in receive_message_result.messages.unwrap_or_default() {
-                // TODO
-                // * Handle empty messages
-                //
-                // parse message
-                // handle_message (process S3 objects)
-                // ack message
+            for message in messages.unwrap_or_default() {
                 let s3_event: S3Event =
                     serde_json::from_str(message.body.unwrap_or_default().as_ref()).unwrap();
 
                 match self.handle_s3_event(s3_event, out.clone()).await {
-                    Ok(()) => {}  // TODO ack message
+                    Ok(()) => {
+                        if self.delete_message {
+                            self.delete_message(message.receipt_handle).await.unwrap();
+                        }
+                    } // TODO ack message
                     Err(()) => {} // TODO emit error
                 }
             }
         }
         Ok(())
     }
-    //let events = self.poll_events().await;
 
-    // Poll for messages
-    // For each message:
-    //   * Parse
-    //   * Forward logs
-    //   * Delete message (if delete_message=true)
+    async fn receive_messages(self) {
+        self.sqs_client
+            .receive_message(ReceiveMessageRequest {
+                // TODO additional parameters?
+                // TODO evaluate wait_time_seconds
+                queue_url: queue_url.to_string(),
+                max_number_of_messages: Some(10),
+                wait_time_seconds: Some(10),
+                // TODO handle timeouts > i64
+                visibility_timeout: Some(self.visibility_timeout.as_secs().try_into().unwrap()),
+                ..Default::default()
+            })
+            .map(|res| res.messages)
+    }
 
-    //let (sink, _) = out
-    //.send_all(futures01::stream::iter_ok(logs))
-    //.compat()
-    //.await
-    //.map_err(|error| error!(message = "Error sending S3 Logs", %error))?;
-    //out = sink;
-    //
+    async fn delete_message(self, receipt_handle: Option<String>) {
+        let receipt_handle = receipt_handle.unwrap_or_default(); // TODO
+        self.sqs_client.delete_message(DeleteMessageRequest {
+            queue_url: self.queue_url.clone(),
+            receipt_handle: receipt_handle.unwrap_or_default(),
+            ..Default::default()
+        })
+    }
+
     async fn handle_s3_event(&self, s3_event: S3Event, out: Pipeline) -> Result<(), ()> {
         for record in s3_event.records {
             match self.handle_s3_event_record(record, out.clone()).await {
@@ -278,7 +309,6 @@ impl SqsIngestor {
         Ok(())
     }
 
-    // TODO handle shutdown
     async fn handle_s3_event_record(
         &self,
         s3_event: S3EventRecord,
@@ -298,9 +328,6 @@ impl SqsIngestor {
 
         match object.body {
             Some(body) => {
-                // .filter_map(|r| )
-                // TODO: decompress
-                // TODO: other codecs
                 let stream = FramedRead::new(
                     body.into_async_read(),
                     BytesDelimitedCodec::new_with_max_length(b'\n', 100000),
@@ -438,6 +465,34 @@ struct S3Object {
 
 //let (service, region,
 //}
+
+// TODO remove?
+// https://github.com/rusoto/rusoto/pull/803 makes it seem like the
+// deserialization / serialization should just work, but it doesn't seem to
+mod string {
+    use serde::{de, Deserialize, Deserializer, Serializer};
+    use std::fmt::Display;
+    use std::str::FromStr;
+
+    pub fn serialize<T, S>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        T: Display,
+        S: Serializer,
+    {
+        serializer.collect_str(value)
+    }
+
+    pub fn deserialize<'de, T, D>(deserializer: D) -> Result<T, D::Error>
+    where
+        T: FromStr,
+        T::Err: Display,
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
+    }
+}
 
 #[cfg(test)]
 mod tests {
